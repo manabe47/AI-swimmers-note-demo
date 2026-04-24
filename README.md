@@ -15,11 +15,17 @@ npm start
 - サーバー: `server.js` (Express)
 - フロント: `public/index.html` (シンプルな作成 + コメントUI)
 - DB: `data/swimmers.db` (SQLite)
+ 
+データ形式
+- `practices.content` は JSON 文字列で格納され、`{ items: [ { type, distance, reps, rest, intensity } ] }` のような構造を想定しています。
 
 主なエンドポイント
 - `POST /api/practice` : `{ title, content, sessionId }` -> 作成し `id` を返す
+- `POST /api/practice` : `{ title, content, sessionId, athleteId }` -> 作成し `id` を返す
 - `GET /api/practice/:id` : 練習データと保存済みコメントを返す
 - `POST /api/comment` : `{ practiceId, sessionId }` -> Ollama に練習を渡してコメントを生成し、`comments` テーブルに保存
+ - `POST /api/athlete` : `{ name, event, best_time }` -> 選手を作成
+ - `GET /api/athletes` : 選手一覧を取得
 
 注意点
 - `GEMMA_MODEL` 環境変数で利用モデルを切り替え可能（既定: `gemma4:26b`）
