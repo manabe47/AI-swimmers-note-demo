@@ -1,0 +1,13 @@
+{
+  "name": "ai-swimmers-note-demo",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.4.0",
+    "sqlite3": "^5.1.6"
+  }
+}
