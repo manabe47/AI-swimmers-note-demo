@@ -17,6 +17,10 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3002;
 const OLLAMA_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS || 120000);
+const AI_MAX_OUTPUT_TOKENS = Number(process.env.AI_MAX_OUTPUT_TOKENS || 1400);
+const MAX_HISTORY_COMMENTS = Number(process.env.MAX_HISTORY_COMMENTS || 8);
+const MAX_CONTINUATION_ATTEMPTS = Number(process.env.MAX_CONTINUATION_ATTEMPTS || 4);
+const COMPLETION_MARKER = '[回答完了]';
 
 // Ensure data dir and DB
 const dataDir = path.join(__dirname, 'data');
@@ -76,6 +80,174 @@ function dbAll(sql, params = []){
   return new Promise((resolve, reject) => {
     db.all(sql, params, (err, rows) => { if(err) reject(err); else resolve(rows); });
   });
+}
+
+function compactText(value, maxLength = 220){
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text;
+}
+
+function summarizeOlderComments(comments){
+  if (!Array.isArray(comments) || comments.length === 0) return '';
+  return comments
+    .map((comment, index) => {
+      const role = comment.role === 'assistant' ? 'AI' : 'コーチ';
+      return `${index + 1}. ${role}: ${compactText(comment.content, 160)}`;
+    })
+    .join('\n');
+}
+
+function buildPracticeAnalysisText(contentObj){
+  if (typeof contentObj === 'string') return String(contentObj);
+  if (!contentObj || !Array.isArray(contentObj.items) || contentObj.items.length === 0) return '練習メニューなし';
+  return contentObj.items.map((item, index) => {
+    const type = item && item.type ? String(item.type) : 'Swim';
+    const stroke = item && item.stroke ? String(item.stroke) : 'Fr';
+    const distance = Number(item && item.distance) || 0;
+    const sets = Number(item && item.sets) || 1;
+    const reps = Number(item && item.reps) || 1;
+    const rest = item && item.rest ? String(item.rest) : '指定なし';
+    const note = item && item.note ? String(item.note) : 'なし';
+    const totalDistance = distance * sets * reps;
+    return [
+      `行${index + 1}`,
+      `種別:${type}`,
+      `種目:${stroke}`,
+      `距離:${distance}m`,
+      `セット:${sets}`,
+      `本数:${reps}`,
+      `サイクル:${rest}`,
+      `備考:${note}`,
+      `総距離:${totalDistance}m`
+    ].join(' / ');
+  }).join('\n');
+}
+
+function buildCoachMessages(practice, athleteContext, contentText, previousComments, contentObj){
+  const comments = Array.isArray(previousComments) ? previousComments : [];
+  const olderComments = comments.slice(0, Math.max(0, comments.length - MAX_HISTORY_COMMENTS));
+  const recentComments = comments.slice(-MAX_HISTORY_COMMENTS);
+  const messages = [];
+  const structuredPracticeText = buildPracticeAnalysisText(contentObj);
+
+  messages.push({
+    role: 'system',
+    content:
+      'あなたは水泳コーチ向けの高度な分析アシスタントです。作成された練習プランについて、良い点、改善点、具体的な修正案を示してください。' +
+      '割り当てられた選手のグループ、専門種目、ベストタイム一覧を踏まえ、負荷や強度の妥当性も必要に応じて評価してください。' +
+      '出力は自然な日本語のみで、最後まで書き切ってください。' +
+      '回答は簡潔だが具体的にし、見出しと箇条書きを中心に、全体で8項目以内を目安にまとめてください。' +
+      '必ず練習メニューの具体的な行番号を引用して評価してください。少なくとも2つ以上の行番号に触れてください。' +
+      '一般論だけを述べるのは禁止です。各指摘は、どの行のどの設定を見てそう判断したかが分かるように書いてください。' +
+      'メニューに書かれていないことは推測しすぎず、不足情報がある場合はその不足も明示してください。' +
+      `回答を書き終えたら、最後の行に必ず ${COMPLETION_MARKER} とだけ書いて終了してください。`
+  });
+
+  messages.push({
+    role: 'user',
+    content:
+      `練習タイトル: ${practice.title || ''}\n\n` +
+      `対象チームの選手情報:\n${athleteContext}\n\n` +
+      `練習内容(表示用):\n${contentText}\n\n` +
+      `練習内容(行ごとの構造化):\n${structuredPracticeText}\n\n` +
+      `練習内容(JSON):\n${JSON.stringify(contentObj || {}, null, 2)}`
+  });
+
+  if (olderComments.length) {
+    messages.push({
+      role: 'system',
+      content:
+        'これまでの会話の要点です。今後の回答ではこの流れを引き継いでください。\n' +
+        summarizeOlderComments(olderComments)
+    });
+  }
+
+  for (const comment of recentComments) {
+    messages.push({
+      role: comment.role === 'assistant' ? 'assistant' : 'user',
+      content: String(comment.content || '')
+    });
+  }
+
+  return messages;
+}
+
+function collectAssistantText(data){
+  if (!data || !Array.isArray(data.choices)) return '';
+  return data.choices
+    .map((choice) => choice && choice.message && choice.message.content ? String(choice.message.content) : '')
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+function hasCompletionMarker(text){
+  return String(text || '').includes(COMPLETION_MARKER);
+}
+
+function stripCompletionMarker(text){
+  return String(text || '')
+    .replace(new RegExp(`\\s*${COMPLETION_MARKER.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`), '')
+    .trim();
+}
+
+function looksIncomplete(text){
+  const value = stripCompletionMarker(text);
+  if (!value) return true;
+  if (hasCompletionMarker(text)) return false;
+  if (/[：:（(、】【,\-]$/.test(value)) return true;
+  if (/^(#{1,6}|\d+\.)\s*$/.test(value.split('\n').pop() || '')) return true;
+  return !/[。！？]$/.test(value);
+}
+
+async function requestCoachResponse(messages){
+  const payload = {
+    model: process.env.GEMMA_MODEL || 'gemma4:26b',
+    messages,
+    temperature: 0.3,
+    max_tokens: AI_MAX_OUTPUT_TOKENS
+  };
+
+  const response = await axios.post('http://localhost:11434/v1/chat/completions', payload, { timeout: OLLAMA_TIMEOUT_MS });
+  return response.data;
+}
+
+async function requestCoachResponseWithContinuation(messages){
+  let aggregatedText = '';
+  let lastData = null;
+  let currentMessages = messages.slice();
+
+  for (let attempt = 0; attempt < MAX_CONTINUATION_ATTEMPTS; attempt += 1) {
+    const data = await requestCoachResponse(currentMessages);
+    lastData = data;
+    const chunk = collectAssistantText(data).trim();
+    if (!chunk) break;
+
+    aggregatedText = aggregatedText ? `${aggregatedText}\n\n${chunk}` : chunk;
+
+    const finishReasons = Array.isArray(data && data.choices)
+      ? data.choices.map((choice) => choice && choice.finish_reason ? choice.finish_reason : '').filter(Boolean)
+      : [];
+    const needsContinuation = finishReasons.includes('length') || looksIncomplete(aggregatedText);
+    if (!needsContinuation) break;
+
+    currentMessages = currentMessages.concat([
+      { role: 'assistant', content: chunk },
+      { role: 'user', content: `回答が途中で切れています。重複を避けて、この続きだけを日本語で簡潔に続けてください。書き終えたら最後の行に必ず ${COMPLETION_MARKER} を付けてください。` }
+    ]);
+  }
+
+  if (lastData && Array.isArray(lastData.choices) && aggregatedText) {
+    lastData.choices = [{
+      ...(lastData.choices[0] || {}),
+      message: {
+        role: 'assistant',
+        content: stripCompletionMarker(aggregatedText)
+      }
+    }];
+  }
+
+  return lastData;
 }
 
 function parsePracticeContent(raw){
@@ -388,30 +560,20 @@ app.post('/api/comment', async (req, res) => {
       : '割り当て選手なし';
 
     const prev = await dbAll('SELECT role, content FROM comments WHERE practice_id = ? ORDER BY id ASC', [practiceId]);
-    const messages = [];
-    messages.push({ role: 'system', content: 'あなたは水泳コーチ向けの高度な分析アシスタントです。作成された練習プランについて、良い点、改善点、具体的な修正案（セット内容・目的に沿った調整）を示してください。割り当てられた選手のグループ、専門種目、ベストタイム一覧を踏まえ、コメントの一項目として負荷や強度の妥当性も必要に応じて評価してください。出力は日本語でお願いします。' });
-    messages.push({ role: 'user', content: `練習タイトル: ${practice.title || ''}\n\n対象チームの選手情報:\n${athleteContext}\n\n練習内容:\n${contentText}` });
-    for(const c of prev) messages.push({ role: c.role, content: c.content });
-
-    const payload = {
-      model: process.env.GEMMA_MODEL || 'gemma4:26b',
-      messages,
-      temperature: 0.3,
-    };
-
-    const r = await axios.post('http://localhost:11434/v1/chat/completions', payload, { timeout: OLLAMA_TIMEOUT_MS });
+    const messages = buildCoachMessages(practice, athleteContext, contentText, prev, contentObj);
+    const responseData = await requestCoachResponseWithContinuation(messages);
 
     // save assistant replies
     try{
-      if(r.data && r.data.choices){
-        for(const c of r.data.choices){
+      if(responseData && responseData.choices){
+        for(const c of responseData.choices){
           const text = (c.message && c.message.content) ? c.message.content : JSON.stringify(c);
           await dbRun('INSERT INTO comments (practice_id, role, content, created_at) VALUES (?, ?, ?, datetime("now"))', [practiceId, 'assistant', text]);
         }
       }
     }catch(e){ console.error('failed to save comment', e); }
 
-    return res.json(r.data);
+    return res.json(responseData);
   }catch(e){ return res.status(500).json({ error: e.toString() }); }
 });
 

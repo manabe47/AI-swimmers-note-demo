@@ -149,6 +149,9 @@
       .comment-accordion summary::-webkit-details-marker{display:none}
       .comment-preview{display:block;margin-top:6px;color:var(--muted);font-size:13px;font-weight:500;line-height:1.6}
       .comment-body{padding:0 14px 14px;white-space:pre-wrap;color:var(--text)}
+      .comment-history-scroll{
+        max-height:420px;overflow:auto;padding-right:4px
+      }
       .practice-table-wrap{
         margin-top:12px;border-radius:14px;border:1px solid #e0e9f8;background:#f7faff;overflow:auto
       }
@@ -803,6 +806,12 @@
             await loadPractices();
           }
 
+          function submitCommentOnCtrlEnter(event){
+            if (!(event.ctrlKey || event.metaKey) || event.key !== 'Enter') return;
+            event.preventDefault();
+            saveManualComment();
+          }
+
           watch(selectedTeams, (value) => {
             localStorage.setItem('ai_swimmers_selected_teams', JSON.stringify(value));
           }, { deep: true });
@@ -874,6 +883,7 @@
             savePractice,
             saveAthlete,
             saveManualComment,
+            submitCommentOnCtrlEnter,
             startCreatePractice,
             startEditPractice,
             startCreateAthlete,
@@ -1025,12 +1035,18 @@
                 </div>
                 <div class="form-row">
                   <label>手入力コメント</label>
-                  <textarea v-model="manualComment" rows="4" placeholder="AIを使わずに残したい所感や指示を入力"></textarea>
+                  <textarea
+                    v-model="manualComment"
+                    rows="4"
+                    placeholder="AIを使わずに残したい所感や指示を入力"
+                    @keydown="submitCommentOnCtrlEnter"
+                  ></textarea>
+                  <div class="footer-note"><code>Ctrl + Enter</code> ですぐ送信できます。</div>
                 </div>
                 <div class="inline-actions">
                   <button class="ghost-btn" @click="saveManualComment">コメントを追加</button>
                 </div>
-                <div class="list-block">
+                <div class="list-block comment-history-scroll">
                   <details
                     v-for="comment in (currentPractice && currentPractice.comments ? currentPractice.comments : [])"
                     :key="comment.id"
